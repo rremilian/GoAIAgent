@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -300,6 +301,76 @@ func createNewFile(filePath, content string) (string, error) {
 
 // END
 
+// Command execution tool
+
+var CommandExecutionDefinition = ToolDefinition{
+	Name:        "command_execution",
+	Description: "Execute commands in Bash. You can execute commands only in the current working directory.",
+	InputSchema: CommandExecutionSchema,
+	Function:    CommandExecution,
+}
+
+type CommandExecutionInput struct {
+	Command string `json:"command" jsonschema_description:"The command which should be executed."`
+}
+
+var CommandExecutionSchema = GenerateSchema[CommandExecutionInput]()
+
+func CommandExecution(input json.RawMessage) (string, error) {
+	commandInput := CommandExecutionInput{}
+	err := json.Unmarshal(input, &commandInput)
+	if err != nil {
+		return "", err
+	}
+
+	if commandInput.Command == "" {
+		return "", fmt.Errorf("command cannot be empty")
+	}
+	// Guardrails:
+	// 1. Disallow dangerous commands
+	disallowed := []string{
+		"rm ", "shutdown", "reboot", "kill ", "passwd", "chown", "chmod", "sudo", "su",
+	}
+	lowerCmd := strings.ToLower(commandInput.Command)
+	for _, d := range disallowed {
+		if strings.Contains(lowerCmd, d) {
+			return "", fmt.Errorf("command contains disallowed operation: %q", d)
+		}
+	}
+	// 2. Disallow directory changes
+	if strings.Contains(lowerCmd, "cd ") {
+		return "", fmt.Errorf("changing directories is not allowed")
+	}
+	// 3. Limit command length
+	if len(commandInput.Command) > 256 {
+		return "", fmt.Errorf("command too long")
+	}
+	// 4. Allow command to affect only the current working directory
+	if strings.Contains(lowerCmd, "/") || strings.Contains(lowerCmd, "..") {
+		return "", fmt.Errorf("command cannot access files outside the current working directory")
+	}
+
+	// Ask user to confirm the command
+	fmt.Printf("\u001b[92mExecuting command:\u001b[0m %s\n", commandInput.Command)
+	fmt.Print("\u001b[93mAre you sure you want to execute this command? (yes/no): \u001b[0m")
+	var confirmation string
+	fmt.Scanln(&confirmation)
+	if strings.ToLower(confirmation) != "yes" {
+		return "", fmt.Errorf("command execution cancelled by user")
+	}
+	cmd := exec.Command("bash", "-c", commandInput.Command)
+	output, err := cmd.CombinedOutput()
+	fmt.Printf("\u001b[92mCommand output:\u001b[0m %s\n", output)
+
+	if err != nil {
+		return "", fmt.Errorf("command execution failed: %s\nOutput: %s", err.Error(), output)
+	}
+
+	return string(output), nil
+}
+
+// END
+
 func main() {
 	client := anthropic.NewClient()
 
@@ -310,7 +381,7 @@ func main() {
 		}
 		return scanner.Text(), true
 	}
-	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition}
+	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, CommandExecutionDefinition}
 	agent := NewAgent(&client, getUserMessage, tools)
 	err := agent.Run(context.TODO())
 	if err != nil {
