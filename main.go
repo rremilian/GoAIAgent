@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
+	"golang.org/x/net/html"
 )
 
 type Agent struct {
@@ -371,6 +374,80 @@ func CommandExecution(input json.RawMessage) (string, error) {
 
 // END
 
+// Fetch URL tool
+
+var FetchUrlDefinition = ToolDefinition{
+	Name:        "fetch_url",
+	Description: "Fetch the contents of a URL. Use this to retrieve data from the web.",
+	InputSchema: FetchUrlInputSchema,
+	Function:    FetchUrl,
+}
+
+type FetchUrlInput struct {
+	Url string `json:"url" jsonschema_description:"The url that should be fetched."`
+}
+
+var FetchUrlInputSchema = GenerateSchema[FetchUrlInput]()
+
+func FetchUrl(input json.RawMessage) (string, error) {
+	fetchUrlInput := FetchUrlInput{}
+	err := json.Unmarshal(input, &fetchUrlInput)
+	if err != nil {
+		return "", err
+	}
+
+	if fetchUrlInput.Url == "" {
+		return "", fmt.Errorf("url cannot be empty")
+	}
+
+	resp, err := http.Get(fetchUrlInput.Url)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to fetch URL: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Clean the HTML content and extract visible text
+	cleaned, err := extractTextFromHTML(string(body))
+	if err != nil {
+		return "", fmt.Errorf("failed to clean HTML: %w", err)
+	}
+
+	return cleaned, nil
+}
+
+// extractTextFromHTML extracts visible text from HTML content.
+func extractTextFromHTML(htmlContent string) (string, error) {
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.TextNode && n.Parent != nil && n.Parent.Data != "script" && n.Parent.Data != "style" {
+			text := strings.TrimSpace(n.Data)
+			if text != "" {
+				sb.WriteString(text)
+				sb.WriteString(" ")
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+	}
+	f(doc)
+	return strings.TrimSpace(sb.String()), nil
+}
+
 func main() {
 	client := anthropic.NewClient()
 
@@ -381,7 +458,7 @@ func main() {
 		}
 		return scanner.Text(), true
 	}
-	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, CommandExecutionDefinition}
+	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, CommandExecutionDefinition, FetchUrlDefinition}
 	agent := NewAgent(&client, getUserMessage, tools)
 	err := agent.Run(context.TODO())
 	if err != nil {
